@@ -557,6 +557,8 @@ export interface ReviewNextTransitionV3 {
 	collect?: { inputs: readonly ReviewCollectInputV3[] };
 	/** status/v5 only: the bounded correction plan request. */
 	correctionRequest?: ReviewCorrectionPlanRequestV1;
+	/** gentle-pi#627: the managed-assets sync continuation, only on a managed_assets_outdated stop. */
+	continuation?: ReviewManagedAssetsContinuationV1;
 }
 
 export interface ReviewStatusV3 {
@@ -710,6 +712,8 @@ export interface ReviewFailureV2 {
 	causeCategory?: ReviewFailureCauseCategoryV2;
 	cause?: string;
 	context?: ReviewFailureContextV2;
+	/** gentle-pi#627: the managed-assets sync continuation, only on a review.start preflight managed_assets_outdated refusal. */
+	continuation?: ReviewManagedAssetsContinuationV1;
 	raw: Readonly<Record<string, unknown>>;
 }
 
@@ -1548,6 +1552,43 @@ export function decodeReviewForecastV1(value: unknown, label = "status.forecast"
 // The two v5 reason codes whose transitions must carry the correction plan
 // request; every other reason code must not.
 const CORRECTION_REQUEST_REASON_CODES = Object.freeze(["correction_plan_required", "corrected_candidate_unavailable"] as const);
+// gentle-pi#627: the one stop reason code (and START preflight failure code)
+// whose record carries the managed-assets sync continuation. The coupling
+// mirrors CORRECTION_REQUEST_REASON_CODES: allowed exactly there, rejected
+// everywhere else, so the exact-key allowlists stay closed.
+export const MANAGED_ASSETS_STOP_REASON_CODE = "managed_assets_outdated" as const;
+
+// gentle-pi#627: the additive `continuation` object gentle-ai attaches to a
+// stale managed-asset stop transition (and to START's preflight failure
+// envelope for the same reason code). It names the ONE operator-runnable
+// remediation: re-running sync through the refusing binary's exact agent
+// scope. Kept optional on both records so providers that report the reason
+// code without a continuation (gentle-ai <= 2.6.0 era, gentle-ai#3299/#4170)
+// keep decoding instead of being rejected for being older than this decoder.
+export interface ReviewManagedAssetsContinuationV1 {
+	/** The remediation operation, e.g. "sync". */
+	operation: string;
+	/** The runnable single-line command, e.g. "gentle-ai sync --agent pi". */
+	command: string;
+	/** The agent scope the sync must converge, e.g. "pi". */
+	agent: string;
+	/** The stale managed-asset identifiers the sync will rewrite. */
+	staleAssets: readonly string[];
+}
+
+function decodeManagedAssetsContinuationV1(value: unknown, label: string): ReviewManagedAssetsContinuationV1 {
+	const body = exactRecord(value, label, ["operation", "command", "agent", "stale_assets"]);
+	const operation = text(body.operation, `${label}.operation`, { minimum: 1, maximum: 64, pattern: /^[a-z][a-z0-9_-]*$/ });
+	const agent = text(body.agent, `${label}.agent`, { minimum: 1, maximum: 64, pattern: /^[a-z][a-z0-9._-]*$/ });
+	// The command must be the provider's own sync verb bound to the same agent
+	// the continuation names -- a single line, no shell metacharriage beyond the
+	// bounded flag tail, and never a substitute remediation.
+	const command = text(body.command, `${label}.command`, { minimum: 1, maximum: 512, pattern: /^gentle-ai sync --agent [^\s]+(?: [^\s]+)*$/ });
+	const commandAgent = /^gentle-ai sync --agent ([^\s]+)/.exec(command)![1]!;
+	if (commandAgent !== agent) throw new TypeError(`${label}.command must bind --agent to ${label}.agent`);
+	const staleAssets = array(body.stale_assets, `${label}.stale_assets`, (entry: unknown, entryLabel: string) => text(entry, entryLabel, { minimum: 1, maximum: 4096, pattern: /^[^\r\n]+$/ }), { unique: true, minimum: 1, maximum: 64 });
+	return { operation, command, agent, staleAssets };
+}
 // v5 capture operations that must carry a submission descriptor.
 const V5_SUBMISSION_CAPTURE_OPERATIONS = Object.freeze(["review.capture-correction-plan"] as const);
 
@@ -1684,7 +1725,7 @@ function decodeCollectInput(value: unknown, label: string, v5: boolean, v6: bool
 export function decodeReviewNextTransitionV3(value: unknown, options: { v5?: boolean; v6?: boolean } = {}): ReviewNextTransitionV3 {
 	const v6 = options.v6 === true;
 	const v5 = options.v5 === true || v6;
-	const transition = exactRecord(value, "next_transition", ["kind", "reason_code"], ["execute", "collect", ...(v5 ? ["correction_request"] : [])]);
+	const transition = exactRecord(value, "next_transition", ["kind", "reason_code"], ["execute", "collect", ...(v5 ? ["correction_request"] : []), "continuation"]);
 	const kind = enumeration(transition.kind, ["execute", "collect", "stop"] as const, "next_transition.kind");
 	const reasonCode = text(transition.reason_code, "next_transition.reason_code", { minimum: 1, pattern: /^[a-z0-9_]+$/ });
 
@@ -1696,6 +1737,17 @@ export function decodeReviewNextTransitionV3(value: unknown, options: { v5?: boo
 		if (required && transition.correction_request === undefined) throw new TypeError(`next_transition.correction_request is required for ${reasonCode}`);
 		if (!required && transition.correction_request !== undefined) throw new TypeError(`next_transition.correction_request is only valid for ${CORRECTION_REQUEST_REASON_CODES.join(", ")}`);
 		if (transition.correction_request !== undefined) correctionRequest = decodeCorrectionPlanRequestV1(transition.correction_request, "next_transition.correction_request");
+	}
+
+	// gentle-pi#627: the managed-assets sync continuation rides exactly its stop
+	// reason code. Optional, not required: deployed providers already report
+	// managed_assets_outdated without one (gentle-ai#3299/#4170), and rejecting
+	// those would break version skew the exact-record allowlist exists to ride.
+	let continuation: ReviewManagedAssetsContinuationV1 | undefined;
+	if (reasonCode === MANAGED_ASSETS_STOP_REASON_CODE) {
+		if (transition.continuation !== undefined) continuation = decodeManagedAssetsContinuationV1(transition.continuation, "next_transition.continuation");
+	} else if (transition.continuation !== undefined) {
+		throw new TypeError(`next_transition.continuation is only valid for a ${MANAGED_ASSETS_STOP_REASON_CODE} stop`);
 	}
 
 	if (kind === "execute") {
@@ -1727,16 +1779,18 @@ export function decodeReviewNextTransitionV3(value: unknown, options: { v5?: boo
 		const decodedExecute: ReviewNextTransitionExecuteV3 = { operation, arguments: argumentsList, ...(selectorArguments === undefined ? {} : { selectorArguments }), preconditions, binding: { targetIdentity, ...(lineageId === undefined ? {} : { lineageId }), ...(revision === undefined ? {} : { revision }) }, ...(command === undefined ? {} : { command }) };
 		if (operation === "review.acknowledge-approved") assertReviewApprovedAcknowledgementExecuteV1(decodedExecute);
 		if (transition.collect !== undefined) throw new TypeError("next_transition.collect is incompatible with execute");
+		if (transition.continuation !== undefined) throw new TypeError("next_transition.continuation is incompatible with execute");
 		return { kind, reasonCode, execute: decodedExecute, ...(correctionRequest === undefined ? {} : { correctionRequest }) };
 	}
 	if (kind === "collect") {
 		const collect = exactRecord(transition.collect, "next_transition.collect", ["inputs"]);
 		const inputs = array(collect.inputs, "next_transition.collect.inputs", (entry, label) => decodeCollectInput(entry, label, v5, v6), { minimum: 1 });
 		if (transition.execute !== undefined) throw new TypeError("next_transition.execute is incompatible with collect");
+		if (transition.continuation !== undefined) throw new TypeError("next_transition.continuation is incompatible with collect");
 		return { kind, reasonCode, collect: { inputs }, ...(correctionRequest === undefined ? {} : { correctionRequest }) };
 	}
 	if (transition.execute !== undefined || transition.collect !== undefined) throw new TypeError("next_transition stop cannot carry a transition");
-	return { kind, reasonCode, ...(correctionRequest === undefined ? {} : { correctionRequest }) };
+	return { kind, reasonCode, ...(correctionRequest === undefined ? {} : { correctionRequest }), ...(continuation === undefined ? {} : { continuation }) };
 }
 
 // ---------------------------------------------------------------------------
@@ -2057,7 +2111,7 @@ function decodeFailureContext(value: unknown, label: string): ReviewFailureConte
 export function decodeReviewFailureV2(value: unknown): ReviewFailureV2 {
 	const body = exactRecord(value, "failure", [
 		"schema", "contract", "operation", "phase", "code", "message", "mutation_outcome", "authority_applicability", "retry_safe", "replayability", "required_inputs", "next_action",
-	], ["lineage_id", "request_digest", "progress_identity", "cause_category", "cause", "context"]);
+	], ["lineage_id", "request_digest", "progress_identity", "cause_category", "cause", "context", "continuation"]);
 	requireIdentity(body, "gentle-ai.review-integration.failure/v2");
 	const operation = enumeration(body.operation, FAILURE_OPERATIONS, "failure.operation");
 
@@ -2067,6 +2121,18 @@ export function decodeReviewFailureV2(value: unknown): ReviewFailureV2 {
 	}
 	if (body.request_digest !== undefined && operation === REVIEW_INTEGRATION_OPERATION.REPAIR && body.progress_identity === undefined) {
 		throw new TypeError("failure.request_digest with review.repair requires progress_identity");
+	}
+
+	// gentle-pi#627: the managed-assets sync continuation rides exactly the START
+	// preflight refusal gentle-ai attaches it to. Optional, never required:
+	// providers that refuse with this code but no continuation (gentle-ai <= 2.6.0
+	// era) must keep decoding, exactly like the stop-transition variant above.
+	let continuation: ReviewManagedAssetsContinuationV1 | undefined;
+	if (body.continuation !== undefined) {
+		if (operation !== REVIEW_INTEGRATION_OPERATION.START || body.phase !== "preflight" || body.code !== MANAGED_ASSETS_STOP_REASON_CODE) {
+			throw new TypeError(`failure.continuation is only valid for a review.start preflight ${MANAGED_ASSETS_STOP_REASON_CODE} refusal`);
+		}
+		continuation = decodeManagedAssetsContinuationV1(body.continuation, "failure.continuation");
 	}
 
 	return {
@@ -2088,6 +2154,7 @@ export function decodeReviewFailureV2(value: unknown): ReviewFailureV2 {
 		...(body.cause_category === undefined ? {} : { causeCategory: text(body.cause_category, "failure.cause_category", { minimum: 1, pattern: /^[a-z0-9]+(?:_[a-z0-9]+)*$/ }) }),
 		...(body.cause === undefined ? {} : { cause: text(body.cause, "failure.cause", { minimum: 1, maximum: 4000, pattern: /^[^\r\n]+$/ }) }),
 		...(body.context === undefined ? {} : { context: decodeFailureContext(body.context, "failure.context") }),
+		...(continuation === undefined ? {} : { continuation }),
 		raw: body,
 	};
 }
@@ -2464,6 +2531,9 @@ function decodeReviewApprovedAcknowledgementV1(value: unknown, label: string): R
 	const repositoryContext = sourceBinding.repository_context === undefined
 		? undefined
 		: text(sourceBinding.repository_context, `${label}.binding.repository_context`, { pattern: /^rctx[12]_[0-9a-f]{64}$/ });
+	// SAFETY: this carrier's fields are raw provider JSON cast only to satisfy the
+	// validator's parameter type; assertReviewApprovedAcknowledgementExecuteShapeV1
+	// below re-validates every field before it is read.
 	const acknowledgement = {
 		operation: body.operation,
 		command: body.command,

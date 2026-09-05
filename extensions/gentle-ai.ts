@@ -3455,6 +3455,25 @@ function mapNativeTargetStatus(operation: ReviewControllerOperation, status: Rev
 			required_status_action: "Use only the provider-selected recovery disposition; do not substitute scope_changed, invalidated, or escalated.",
 		};
 	}
+	// gentle-pi#627: a stale managed-asset set stops the lifecycle with the one
+	// operator-runnable remediation in its continuation. Surface that command
+	// top-level instead of letting it ride invisible inside result.next_transition:
+	// the operator (and the agent driving this facade) must be told to run sync
+	// through the refusing binary's exact agent scope before re-entering STATUS.
+	if (status.nextTransition?.kind === "stop" && status.nextTransition.continuation !== undefined) {
+		const stopContinuation = status.nextTransition.continuation;
+		return {
+			operation,
+			status: "blocked",
+			result: status.raw,
+			...(requestedLineageId === undefined ? {} : { requested_lineage_id: requestedLineageId }),
+			stop_reason_code: status.nextTransition.reasonCode,
+			sync_command: stopContinuation.command,
+			sync_agent: stopContinuation.agent,
+			stale_assets: [...stopContinuation.staleAssets],
+			next_action: `Managed reviewer assets for agent ${stopContinuation.agent} are stale (${stopContinuation.staleAssets.length} asset(s)); run \`${stopContinuation.command}\` to synchronize them, then re-enter negotiated STATUS with gentle_review {"operation":"inspect"} and follow the transition it returns.`,
+		};
+	}
 	return {
 		operation,
 		status: status.action === "start" ? "ready" : "blocked",
@@ -3929,7 +3948,7 @@ function completeNativeStart(
 }
 
 function nativeOperationFailure(operation: ReviewControllerOperation | "gentle_review_capture", error: unknown): Record<string, unknown> {
-	const value = error as { mutationOutcome?: unknown; nextAction?: unknown; diagnostics?: unknown; auditRecord?: unknown; launchAttempted?: unknown; candidateViewPreNative?: unknown; failureEnvelope?: { raw?: unknown; mutationOutcome?: unknown; replayability?: unknown; nextAction?: unknown } };
+	const value = error as { mutationOutcome?: unknown; nextAction?: unknown; diagnostics?: unknown; auditRecord?: unknown; launchAttempted?: unknown; candidateViewPreNative?: unknown; failureEnvelope?: { raw?: unknown; mutationOutcome?: unknown; replayability?: unknown; nextAction?: unknown; continuation?: ReviewManagedAssetsContinuationV1 } };
 	if (isRecord(value.failureEnvelope) && isRecord(value.failureEnvelope.raw)) {
 		const mutationOutcome = value.failureEnvelope.mutationOutcome;
 		return {
@@ -3943,6 +3962,14 @@ function nativeOperationFailure(operation: ReviewControllerOperation | "gentle_r
 					: { mutation_performed: false, mutation_outcome: "none" }),
 			...(typeof value.failureEnvelope.replayability === "string" ? { replayability: value.failureEnvelope.replayability } : {}),
 			...(typeof value.failureEnvelope.nextAction === "string" ? { next_action: value.failureEnvelope.nextAction } : {}),
+			// gentle-pi#627: the START preflight managed-assets refusal carries the
+			// runnable sync continuation; surface it beside the envelope so the
+			// operator runs the exact refusing binary's sync instead of a bare stop.
+			...(value.failureEnvelope.continuation === undefined ? {} : {
+				sync_command: value.failureEnvelope.continuation.command,
+				sync_agent: value.failureEnvelope.continuation.agent,
+				next_action: `Managed reviewer assets for agent ${value.failureEnvelope.continuation.agent} are stale (${value.failureEnvelope.continuation.staleAssets.length} asset(s)); run \`${value.failureEnvelope.continuation.command}\` to synchronize them, then re-enter negotiated STATUS with gentle_review {"operation":"inspect"} and follow the transition it returns.`,
+			}),
 		};
 	}
 	// Every consent binding guard runs before the provider is launched, so this
@@ -5837,6 +5864,7 @@ export const __testing = {
 	loadRuntimeGuardrailsConfig,
 	buildGentlePrompt,
 	nativeStatusUnsupported,
+	nativeOperationFailure,
 	executeReviewControllerOperation,
 	executeReviewCaptureOperation,
 	executeReviewCaptureGroupOperation,
