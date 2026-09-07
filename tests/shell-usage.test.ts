@@ -13,6 +13,7 @@ import {
 	renderUsageBar,
 	renderUsagePanel,
 	SUPPORTED_USAGE_PROVIDERS,
+	isUsageProvider,
 	UsageStore,
 	windowLabel,
 	ZAI_GLM_PROVIDER,
@@ -268,8 +269,56 @@ test("fetchZaiUsage sends the bearer key and parses the quota payload", async ()
 	assert.equal(await fetchZaiUsage(ZAI_PROVIDER, "zai-key", fakeZaiFetch({}, false).fetchFn, NOW), undefined);
 });
 
-test("parseUsageHeaders picks whichever provider the headers belong to", () => {
-	assert.equal(parseUsageHeaders({ "x-codex-primary-used-percent": "10", "x-codex-primary-window-minutes": "300" }, NOW)?.provider, "openai-codex");
-	assert.equal(parseUsageHeaders({ "anthropic-ratelimit-unified-5h-utilization": "0.1" }, NOW)?.provider, "anthropic");
-	assert.equal(parseUsageHeaders({ "content-type": "application/json" }, NOW), undefined);
-});
+    test("parseUsageHeaders picks whichever provider the headers belong to", () => {
+    	assert.equal(parseUsageHeaders({ "x-codex-primary-used-percent": "10", "x-codex-primary-window-minutes": "300" }, NOW)?.provider, "openai-codex");
+    	assert.equal(parseUsageHeaders({ "anthropic-ratelimit-unified-5h-utilization": "0.1" }, NOW)?.provider, "anthropic");
+    	assert.equal(parseUsageHeaders({ "content-type": "application/json" }, NOW), undefined);
+    });
+    
+    test("parseZaiUsage clamps percentages into 0-100 and marks the limit reached at 100", () => {
+    	const payload = {
+    		data: {
+    			limits: [
+    				{ type: "TOKENS_LIMIT", unit: 3, percentage: 137, nextResetTime: 1788824370973 },
+    				{ type: "TOKENS_LIMIT", unit: 6, percentage: -7, nextResetTime: 1789392229980 },
+    			],
+    			level: "max",
+    		},
+    	};
+    	const usage = parseZaiUsage(ZAI_PROVIDER, payload, NOW);
+    	const windows = usage.limits[0]?.windows ?? [];
+    	assert.equal(windows[0]?.usedPercent, 100, "an over-range percentage is clamped down to 100");
+    	assert.equal(windows[1]?.usedPercent, 0, "a negative percentage is clamped up to 0");
+    	assert.equal(usage.limits[0]?.limitReached, true, "a window at 100 means the limit is reached");
+    });
+    
+    test("parseZaiUsage skips windows whose percentage is not a finite number", () => {
+    	const payload = {
+    		data: {
+    			limits: [
+    				{ type: "TOKENS_LIMIT", unit: 3, percentage: Number.NaN, nextResetTime: 1788824370973 },
+    				{ type: "TOKENS_LIMIT", unit: 6, percentage: 42, nextResetTime: 1789392229980 },
+    			],
+    		},
+    	};
+    	const usage = parseZaiUsage(ZAI_PROVIDER, payload, NOW);
+    	const windows = usage.limits[0]?.windows ?? [];
+    	assert.equal(windows.length, 1, "only the finite-percentage window survives");
+    	assert.equal(windows[0]?.usedPercent, 42);
+    	assert.equal(usage.limits[0]?.limitReached, false);
+    });
+    
+    test("fetchZaiUsage returns undefined when the request itself fails", async () => {
+    	const fetchFn = (async () => {
+    		throw new Error("network down");
+    	}) as typeof fetch;
+    	assert.equal(await fetchZaiUsage(ZAI_PROVIDER, "zai-key", fetchFn, NOW), undefined);
+    });
+    
+    test("isUsageProvider accepts exactly codex and the z.ai providers", () => {
+    	assert.equal(isUsageProvider("openai-codex"), true);
+    	assert.equal(isUsageProvider("zai"), true);
+    	assert.equal(isUsageProvider("zai-glm"), true);
+    	assert.equal(isUsageProvider("anthropic"), false, "anthropic usage arrives via headers, not a fetch");
+    	assert.equal(isUsageProvider("ollama"), false);
+    });
