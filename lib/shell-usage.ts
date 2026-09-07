@@ -3,8 +3,8 @@ import { paintGauge } from "./shell-gauge.ts";
 
 // Gentle Shell subscription usage: the rate-limit windows each connected
 // provider reports. Codex sends them as SSE headers and through its usage
-// endpoint; both land in the same model. Parsing is pure and never keeps
-// account details beyond the plan name.
+// endpoint, z.ai through a quota endpoint; all land in the same model.
+// Parsing is pure and never keeps account details beyond the plan name.
 
 export interface UsageWindow {
 	label: string;
@@ -54,6 +54,17 @@ interface RawCodexUsage {
 	additional_rate_limits?: RawAdditionalLimit[] | null;
 }
 
+interface RawZaiLimit {
+	type?: string;
+	unit?: number;
+	percentage?: number;
+	nextResetTime?: number;
+}
+
+interface RawZaiUsage {
+	data?: { limits?: RawZaiLimit[]; level?: string } | null;
+}
+
 export const CODEX_PROVIDER = "openai-codex";
 export const ANTHROPIC_PROVIDER = "anthropic";
 const ANTHROPIC_MAIN_LIMIT = "claude";
@@ -64,6 +75,18 @@ const ANTHROPIC_WINDOWS: ReadonlyArray<[key: string, seconds: number]> = [
 ];
 export const CODEX_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage";
 const CODEX_MAIN_LIMIT = "codex";
+export const ZAI_PROVIDER = "zai";
+export const ZAI_GLM_PROVIDER = "zai-glm";
+export const ZAI_USAGE_PROVIDERS: readonly string[] = [ZAI_PROVIDER, ZAI_GLM_PROVIDER];
+export const ZAI_USAGE_URL = "https://api.z.ai/api/monitor/usage/quota/limit";
+const ZAI_MAIN_LIMIT = "zai";
+// z.ai meters its GLM Coding Plan in token windows keyed by unit: 3 is the
+// 5-hour rolling window, 6 the weekly one. The web-search counter rides the
+// same array as TIME_LIMIT and stays out of the subscription view.
+const ZAI_TOKEN_UNITS: ReadonlyMap<number, number> = new Map([
+	[3, 18_000],
+	[6, 604_800],
+]);
 const CODEX_ACCOUNT_CLAIM = "https://api.openai.com/auth";
 const HEADER_PREFIX = "x-codex-";
 const PANEL_METER_CELLS = 16;
@@ -81,10 +104,12 @@ const ROLE = {
 	SEPARATOR: "muted",
 } as const;
 export const USAGE_EMPTY_MESSAGE = "No subscription usage yet. Usage arrives with the next response, or press r to fetch it.";
-export const SUPPORTED_USAGE_PROVIDERS: readonly string[] = [CODEX_PROVIDER, ANTHROPIC_PROVIDER];
+export const SUPPORTED_USAGE_PROVIDERS: readonly string[] = [CODEX_PROVIDER, ANTHROPIC_PROVIDER, ZAI_PROVIDER, ZAI_GLM_PROVIDER];
 const PENDING_NOTE: Record<string, string> = {
 	[CODEX_PROVIDER]: "no usage yet · r to fetch",
 	[ANTHROPIC_PROVIDER]: "usage arrives with the first response",
+	[ZAI_PROVIDER]: "no usage yet · r to fetch",
+	[ZAI_GLM_PROVIDER]: "no usage yet · r to fetch",
 };
 const UNSUPPORTED_NOTE = "no subscription usage for this provider";
 const ACTIVE_MARK = "✿";
@@ -139,7 +164,26 @@ export function parseCodexUsage(payload: unknown, now: number): ProviderUsage {
 	return { provider: CODEX_PROVIDER, plan: typeof raw.plan_type === "string" ? raw.plan_type : undefined, limits, fetchedAt: now };
 }
 
-function headerWindow(headers: Record<string, string>, kind: "primary" | "secondary", now: number): UsageWindow | undefined {
+// z.ai's quota endpoint is undocumented: the token windows arrive as integer
+// percentages with epoch-millisecond resets (older plans labelled them
+// CREDIT_LIMIT), so unknown shapes degrade to empty limits instead of failing.
+export function parseZaiUsage(provider: string, payload: unknown, now: number): ProviderUsage {
+	const raw = (payload ?? {}) as RawZaiUsage;
+	const windows: UsageWindow[] = [];
+	const entries = Array.isArray(raw.data?.limits) ? raw.data.limits : [];
+	for (const entry of entries) {
+		const item = (entry ?? {}) as RawZaiLimit;
+		const windowSeconds = typeof item.unit === "number" ? ZAI_TOKEN_UNITS.get(item.unit) : undefined;
+		if (windowSeconds === undefined) continue;
+		if (item.type !== "TOKENS_LIMIT" && item.type !== "CREDIT_LIMIT") continue;
+		if (typeof item.percentage !== "number") continue;
+		windows.push({ label: windowLabel(windowSeconds), usedPercent: item.percentage, windowSeconds, resetAt: typeof item.nextResetTime === "number" ? item.nextResetTime : null });
+	}
+	const limits = windows.length > 0 ? [{ name: ZAI_MAIN_LIMIT, windows, limitReached: false }] : [];
+	return { provider, plan: typeof raw.data?.level === "string" ? raw.data.level : undefined, limits, fetchedAt: now };
+}
+
+function headerWindow(headers: Record<string, string>, kind: "primary" | "secondary", _now: number): UsageWindow | undefined {
 	const used = Number.parseFloat(headers[`${HEADER_PREFIX}${kind}-used-percent`] ?? "");
 	if (!Number.isFinite(used)) return undefined;
 	const minutes = Number.parseInt(headers[`${HEADER_PREFIX}${kind}-window-minutes`] ?? "", 10);
