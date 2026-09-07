@@ -133,6 +133,7 @@ pi
 /gentle:sdd-preflight   Run or reuse the session SDD preflight explicitly.
 /gentle-sdd-init           Create or refresh openspec/config.yaml (openspec/both stores only).
 /gentle:models             Assign global model/effort routing to SDD/custom agents.
+/gentle:profile            Switch the main model and all agent routes by named profile.
 /gentle:persona            Switch between gentleman and neutral persona modes.
 /gentle:background-subagents  Show or set the managed background-subagents policy, with its deciding source.
 /gentle:banner             Configure startup rose, text logo, and color preset.
@@ -580,6 +581,31 @@ Config shape (per agent):
 ```
 
 Legacy string entries are still accepted and treated as `model`-only config.
+
+### Named model profiles
+
+Use `/gentle:profile` to switch the main Pi model and every saved agent route together. Pass a name for direct activation (`/gentle:profile openai`) or omit it to open the selector. Profiles live at `~/.pi/gentle-ai/model-profiles.json`:
+
+```json
+{
+  "version": 1,
+  "active": "openai",
+  "profiles": {
+    "openai": {
+      "model": "openai-codex/gpt-5.6-sol",
+      "thinking": "medium",
+      "agents": {
+        "gentle-ai-worker": {
+          "model": "openai-codex/gpt-5.6-terra",
+          "thinking": "high"
+        }
+      }
+    }
+  }
+}
+```
+
+Activation validates and selects the main model first, writes its provider/model/thinking as the defaults for future Pi sessions, replaces the saved Gentle AI agent routing, and regenerates Pi's subagent profiles through the normal routing path. It preserves unrelated Pi settings. The current conversation is not migrated or reset; subsequent turns use the newly selected model.
 
 ## Gentle Shell
 

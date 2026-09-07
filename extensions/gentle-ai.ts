@@ -155,6 +155,16 @@ import {
 } from "../lib/review-integration-v2.ts";
 import { reconcileUnknownReviewLastEventCapture } from "../lib/review-last-event-controller.ts";
 import { recordReviewConsentLatch } from "../lib/review-consent-latch.ts";
+import {
+	MODEL_PROFILES_VERSION,
+	readModelProfiles,
+	readPiSettings,
+	routingForProfile,
+	splitModelRef,
+	writeModelProfiles,
+	writePiModelDefaults,
+	type ModelProfilesConfig,
+} from "../lib/model-profiles.ts";
 
 const GRAPH_V1_ORDINARY_READ_ONLY = "Graph-v1 ordinary review authority is read-only; use native compact-v2 review operations";
 const PACKAGE_ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
@@ -1178,6 +1188,7 @@ function collectPathInputs(value: unknown, key?: string): string[] {
 
 function hasWritableEngramTool(pi: ExtensionAPI): boolean {
 	try {
+		// SAFETY: ExtensionAPI versions without getActiveTools are supported by the runtime feature probe below.
 		const getActiveTools = (pi as unknown as { getActiveTools?: () => unknown[] })
 			.getActiveTools;
 		if (typeof getActiveTools !== "function") return false;
@@ -1355,6 +1366,14 @@ function modelConfigPath(_cwd: string): string {
 
 function modelExportPath(_cwd: string): string {
 	return join(gentleAiConfigHome(), "models.export.json");
+}
+
+function modelProfilesPath(): string {
+	return join(gentleAiConfigHome(), "model-profiles.json");
+}
+
+function globalPiSettingsPath(): string {
+	return join(gentlePiAgentHome(), "settings.json");
 }
 
 const MODEL_EXPORT_KIND = "gentle-pi.agent_model_routing";
@@ -1613,24 +1632,6 @@ function builtinAgentDirs(cwd: string): string[] {
 		join(cwd, ".pi", "npm", "node_modules", "pi-subagents", "agents"),
 		join(homedir(), ".local", "lib", "node_modules", "pi-subagents", "agents"),
 	];
-}
-
-function listBuiltinAgentNames(cwd: string): Set<string> {
-	return new Set(
-		builtinAgentDirs(cwd).flatMap((dir) =>
-			listAgentsFromDir(dir, "builtin").map((agent) => agent.name),
-		),
-	);
-}
-
-async function listBuiltinAgentNamesAsync(cwd: string): Promise<Set<string>> {
-	const names = new Set<string>();
-	for (const dir of builtinAgentDirs(cwd)) {
-		for (const agent of await listAgentsFromDirAsync(dir, "builtin")) {
-			names.add(agent.name);
-		}
-	}
-	return names;
 }
 
 function listDiscoverableAgents(cwd: string): AgentEntry[] {
@@ -2603,6 +2604,91 @@ async function handleModelsCommand(ctx: ExtensionContext): Promise<void> {
 	);
 }
 
+async function handleModelProfileCommand(
+	pi: ExtensionAPI,
+	args: string,
+	ctx: ExtensionContext,
+): Promise<void> {
+	const path = modelProfilesPath();
+	const saved = readModelProfiles(path);
+	if (saved.status !== "valid") {
+		ctx.ui.notify(
+			saved.status === "missing"
+				? `No named model profiles found. Create ${path}, then run /gentle:profile again.`
+				: `Named model profiles are invalid: ${path}`,
+			"warning",
+		);
+		return;
+	}
+	const names = Object.keys(saved.config.profiles).sort();
+	const requested = args.trim();
+	const name = requested.length > 0
+		? requested
+		: await ctx.ui.select(
+			`Select model profile${saved.config.active ? ` (active: ${sanitizeTerminalText(saved.config.active)})` : ""}`,
+			names,
+		);
+	if (!name) return;
+	const normalizedName = name;
+	const profile = saved.config.profiles[normalizedName];
+	if (!profile) {
+		ctx.ui.notify(`Unknown model profile "${sanitizeTerminalText(normalizedName)}". Available: ${names.map(sanitizeTerminalText).join(", ")}`, "warning");
+		return;
+	}
+	const modelRef = splitModelRef(profile.model);
+	if (!modelRef) {
+		ctx.ui.notify(`Invalid main model in profile "${sanitizeTerminalText(normalizedName)}": ${sanitizeTerminalText(profile.model)}`, "warning");
+		return;
+	}
+	const model = ctx.modelRegistry.find(modelRef.provider, modelRef.model);
+	if (!model) {
+		ctx.ui.notify(`Model ${sanitizeTerminalText(profile.model)} is not available. Refresh the provider catalog or authenticate it first.`, "warning");
+		return;
+	}
+	let currentRouting: AgentModelConfig = {};
+	try {
+		readPiSettings(globalPiSettingsPath());
+		const savedRouting = await readSavedModelConfigAsync(ctx.cwd);
+		if (savedRouting.status === "invalid") throw new Error(`Invalid model routing config: ${savedRouting.path}`);
+		if (savedRouting.status === "valid") currentRouting = savedRouting.config;
+	} catch (error) {
+		ctx.ui.notify(error instanceof Error ? error.message : String(error), "warning");
+		return;
+	}
+	const selected = await pi.setModel(model);
+	if (!selected) {
+		ctx.ui.notify(`No authentication is configured for ${sanitizeTerminalText(profile.model)}. Run /login first.`, "warning");
+		return;
+	}
+	if (profile.thinking !== undefined) pi.setThinkingLevel(profile.thinking);
+	try {
+		const routing = routingForProfile(profile.agents, currentRouting);
+		await writeModelConfigAsync(ctx.cwd, routing);
+		const applyResult = await applyModelConfigAsync(ctx.cwd, routing);
+		writePiModelDefaults(globalPiSettingsPath(), profile.model, profile.thinking);
+		const nextConfig: ModelProfilesConfig = {
+			version: MODEL_PROFILES_VERSION,
+			active: normalizedName,
+			profiles: saved.config.profiles,
+		};
+		writeModelProfiles(path, nextConfig);
+		ctx.ui.notify(
+			[
+				`Model profile "${sanitizeTerminalText(normalizedName)}" activated.`,
+				`Main model: ${sanitizeTerminalText(profile.model)}${profile.thinking ? ` · ${profile.thinking}` : ""}`,
+				`Agents updated: ${applyResult.updated}`,
+				"The current conversation stays intact; subsequent turns use the selected model.",
+			].join("\n"),
+			"info",
+		);
+	} catch (error) {
+		ctx.ui.notify(
+			`The session model changed, but persisting profile "${sanitizeTerminalText(normalizedName)}" failed: ${error instanceof Error ? error.message : String(error)}`,
+			"warning",
+		);
+	}
+}
+
 async function handlePersonaCommand(ctx: ExtensionContext): Promise<void> {
 	const current = readPersonaMode(ctx.cwd);
 	const selected = await ctx.ui.select(
@@ -2965,6 +3051,7 @@ async function authorizeDestructiveReviewOperation(
 
 function parseReviewBudget(value: unknown, label: string): ReviewBudgetV1 {
 	if (!isRecord(value)) throw new Error(`${label} must be an object`);
+	// SAFETY: The reducer owns the full runtime validation of this opaque review budget object.
 	return value as unknown as ReviewBudgetV1;
 }
 
@@ -3010,14 +3097,6 @@ function parseStartInput(value: Record<string, unknown>): ReviewControllerStartI
 
 function isReviewTransition(value: string): value is ReviewTransition {
 	return Object.values(REVIEW_TRANSITION).some((transition) => transition === value);
-}
-
-function isGraphV1JudgmentDayLineage(cwd: string, lineageId: string): boolean {
-	try {
-		return ReviewTransactionStore.forRepository(cwd).read(lineageId).mode === REVIEW_MODE.JUDGMENT_DAY;
-	} catch {
-		return false;
-	}
 }
 
 interface NativeStartPreAuthorityRejection {
@@ -3128,6 +3207,7 @@ function nativeStatusUnsupported(operation: ReviewControllerOperation): Record<s
 function asNativeReviewCliError(error: unknown): { code: string; diagnostics: NativeReviewProcessDiagnostics } | undefined {
 	if (error instanceof NativeReviewCliError) return error;
 	if (!(error instanceof Error) || error.name !== "NativeReviewCliError") return undefined;
+	// SAFETY: Only the guarded cross-module error name is inspected, and every projected field is validated below.
 	const value = error as unknown as { code?: unknown; diagnostics?: unknown };
 	if (typeof value.code !== "string") return undefined;
 	const diagnostics = sanitizeForeignNativeReviewDiagnostics(value.diagnostics);
@@ -3138,6 +3218,7 @@ function asNativeReviewCliError(error: unknown): { code: string; diagnostics: Na
 function asNativeReviewConsentBindingError(error: unknown): { reason: string; message: string } | undefined {
 	if (error instanceof NativeReviewConsentBindingError) return { reason: error.reason, message: error.message };
 	if (!(error instanceof Error) || error.name !== "NativeReviewConsentBindingError") return undefined;
+	// SAFETY: Only the guarded cross-module error name is inspected, and reason is type-checked before use.
 	const reason = (error as unknown as { reason?: unknown }).reason;
 	return typeof reason !== "string" || reason.length === 0 ? undefined : { reason, message: error.message };
 }
@@ -3780,6 +3861,7 @@ const processAgentEndSessionBaseline = new Map<PendingReviewConsentSessionKey, s
 
 function pendingReviewConsentSessionKey(context: ExtensionContext | undefined, fallbackKey: symbol): PendingReviewConsentSessionKey {
 	try {
+		// SAFETY: Minimal test contexts may omit sessionManager; optional chaining and the string check bound the probe.
 		const sessionManager = (context as unknown as { sessionManager?: { getSessionId?: () => unknown } } | undefined)?.sessionManager;
 		const sessionId = sessionManager?.getSessionId?.();
 		if (typeof sessionId === "string") return sessionId;
@@ -4239,10 +4321,6 @@ function syncRetainedNativeStatusSelections(selections: Map<string, RetainedNati
 	retainNativeCaptureRoutes(selections, workspaceRoot, status, baseRef);
 }
 
-function requiresExplicitTargetLifecycleRoot(requested: string | undefined, sessionCwd: string, workspaceRoot: string): boolean {
-	return requested !== undefined || workspaceRoot !== sessionCwd;
-}
-
 // gentle-pi#311 P4 — the thin Pi host relay. The provider decides which
 // capture slots the host satisfies by issuing the --materialize token on a
 // pi-bound `review.capture-result` collect input; nothing is ever inferred.
@@ -4578,7 +4656,10 @@ interface NegotiatedHostTransportStatus {
 const reviewTransportRefusalByProvider = new WeakMap<object, ReviewTransportRefusal>();
 
 function clearReviewTransportProbeForTesting(nativeReviewCli: NativeReviewCli | null): void {
-	if (nativeReviewCli !== null) reviewTransportRefusalByProvider.delete(nativeReviewCli as unknown as object);
+	if (nativeReviewCli !== null) {
+		// SAFETY: NativeReviewCli instances are object identities used only as WeakMap keys.
+		reviewTransportRefusalByProvider.delete(nativeReviewCli as unknown as object);
+	}
 }
 
 function hostTransportUnavailable(
@@ -4620,6 +4701,7 @@ async function negotiatedStatusForHostTransport(
 	retainedSelections: Map<string, RetainedNativeStatusSelection>,
 	canonicalRetentionRoot = request.cwd,
 ): Promise<NegotiatedHostTransportStatus> {
+	// SAFETY: NativeReviewCli instances are object identities used only as WeakMap keys.
 	const provider = nativeReviewCli as unknown as object;
 	const remembered = reviewTransportRefusalByProvider.get(provider);
 	if (remembered !== undefined) return { transport: remembered };
@@ -5144,7 +5226,6 @@ async function executeReviewControllerOperation(
 	const parameters = parseReviewControllerParameters(parametersValue);
 	const defaultCwd = resolveReviewControllerWorkspaceRoot(parameters.workspaceRoot, sessionCwd, candidateViews, parameters.lineageId);
 	const pendingReviewConsentSession = pendingReviewConsentSessionKey(context, pendingReviewConsentFallbackKey);
-	const useTargetLifecycleRoot = requiresExplicitTargetLifecycleRoot(parameters.workspaceRoot, sessionCwd, defaultCwd);
 	const includeWorkspaceRoot = parameters.workspaceRoot !== undefined || defaultCwd !== sessionCwd;
 	if (parameters.operation === REVIEW_CONTROLLER_OPERATION.EXPORT || parameters.operation === REVIEW_CONTROLLER_OPERATION.IMPORT) {
 		// Legacy bundle transport rode on the retired pre-integration graph/compact
@@ -5790,6 +5871,7 @@ async function executeReviewControllerOperation(
 			lineageId: parameters.lineageId,
 			transition: transitionValue,
 			idempotencyKey,
+			// SAFETY: parseControllerJson produced an object and the reducer performs operation-specific validation.
 			input: rawInput as unknown as ReviewReducerInput,
 		});
 		return {
@@ -6361,6 +6443,13 @@ function createGentleAiExtensionForTesting(
 		description: "Configure global per-agent models for el Gentleman.",
 		handler: async (_args, ctx) => {
 			await handleModelsCommand(ctx);
+		},
+	});
+
+	pi.registerCommand("gentle:profile", {
+		description: "Switch the main Pi model and all Gentle AI agent routing by named profile.",
+		handler: async (args, ctx) => {
+			await handleModelProfileCommand(pi, args, ctx);
 		},
 	});
 
