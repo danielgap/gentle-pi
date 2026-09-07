@@ -8,12 +8,19 @@ import {
 	parseCodexHeaders,
 	parseUsageHeaders,
 	parseCodexUsage,
+	parseZaiUsage,
+	providerNote,
 	renderUsageBar,
 	renderUsagePanel,
+	SUPPORTED_USAGE_PROVIDERS,
 	UsageStore,
 	windowLabel,
+	ZAI_GLM_PROVIDER,
+	ZAI_PROVIDER,
+	ZAI_USAGE_PROVIDERS,
 	type ProviderUsage,
 } from "../lib/shell-usage.ts";
+import { fetchZaiUsage } from "../extensions/gentle-shell.ts";
 
 // Subscription usage: what each connected provider says about its windows.
 // Parsers are pure; the store only remembers the latest snapshot.
@@ -188,6 +195,77 @@ test("parseAnthropicHeaders turns the unified utilization fractions into 5h and 
 	assert.equal(usage.limits[0].limitReached, false);
 	assert.equal(parseAnthropicHeaders({ ...headers, "anthropic-ratelimit-unified-status": "rejected" }, NOW)?.limits[0].limitReached, true);
 	assert.equal(parseAnthropicHeaders({ "anthropic-ratelimit-requests-remaining": "99" }, NOW), undefined);
+});
+
+const ZAI_PAYLOAD = {
+	code: 200,
+	msg: "Operation successful",
+	data: {
+		limits: [
+			{ type: "TIME_LIMIT", unit: 5, number: 1, usage: 4000, currentValue: 0, remaining: 4000, percentage: 0, nextResetTime: 1789651429999, usageDetails: [{ modelCode: "search-prime", usage: 0 }] },
+			{ type: "TOKENS_LIMIT", unit: 3, number: 5, percentage: 5, nextResetTime: 1788824370973 },
+			{ type: "TOKENS_LIMIT", unit: 6, number: 1, percentage: 6, nextResetTime: 1789392229980 },
+		],
+		level: "max",
+	},
+	success: true,
+};
+
+test("parseZaiUsage keeps the plan and the two token windows, and drops the search counter", () => {
+	const usage = parseZaiUsage(ZAI_GLM_PROVIDER, ZAI_PAYLOAD, NOW);
+	assert.equal(usage.provider, "zai-glm");
+	assert.equal(usage.plan, "max");
+	assert.equal(usage.fetchedAt, NOW);
+	assert.deepEqual(usage.limits.map((limit) => ({ name: limit.name, limitReached: limit.limitReached, windows: limit.windows.map((w) => `${w.label}:${w.usedPercent}:${w.windowSeconds}:${w.resetAt}`) })), [
+		{ name: "zai", limitReached: false, windows: ["5h:5:18000:1788824370973", "week:6:604800:1789392229980"] },
+	]);
+});
+
+test("parseZaiUsage accepts CREDIT_LIMIT windows and degrades to empty limits without throwing", () => {
+	const credit = parseZaiUsage(ZAI_PROVIDER, { data: { limits: [{ type: "CREDIT_LIMIT", unit: 3, percentage: 41, nextResetTime: 1788824370973 }], level: "lite" } }, NOW);
+	assert.deepEqual(credit.limits[0].windows.map((w) => `${w.label}:${w.usedPercent}`), ["5h:41"]);
+	assert.equal(credit.plan, "lite");
+
+	const missingReset = parseZaiUsage(ZAI_PROVIDER, { data: { limits: [{ type: "TOKENS_LIMIT", unit: 6, percentage: 3 }] } }, NOW);
+	assert.deepEqual(missingReset.limits[0].windows.map((w) => w.resetAt), [null]);
+
+	const unusable = parseZaiUsage(ZAI_PROVIDER, { data: { limits: [{ type: "TOKENS_LIMIT", unit: 3, percentage: "5" }, { type: "TOKENS_LIMIT", unit: 9, percentage: 7 }, { type: "MYSTERY_LIMIT", unit: 6, percentage: 7 }, null] } }, NOW);
+	assert.deepEqual(unusable.limits, []);
+	assert.equal(unusable.plan, undefined);
+
+	assert.deepEqual(parseZaiUsage(ZAI_PROVIDER, null, NOW).limits, []);
+	assert.deepEqual(parseZaiUsage(ZAI_PROVIDER, undefined, NOW).limits, []);
+});
+
+test("the zai providers are registered as supported with the fetch note", () => {
+	assert.deepEqual(ZAI_USAGE_PROVIDERS, ["zai", "zai-glm"]);
+	for (const provider of ZAI_USAGE_PROVIDERS) {
+		assert.ok(SUPPORTED_USAGE_PROVIDERS.includes(provider));
+		assert.equal(providerNote(provider), "no usage yet · r to fetch");
+	}
+});
+
+function fakeZaiFetch(payload: unknown = ZAI_PAYLOAD, ok = true) {
+	const calls: Array<{ url: string; headers: Record<string, string> }> = [];
+	const fetchFn = (async (url: string | URL, init?: RequestInit) => {
+		calls.push({ url: String(url), headers: (init?.headers ?? {}) as Record<string, string> });
+		return { ok, json: async () => payload } as Response;
+	}) as typeof fetch;
+	return { fetchFn, calls };
+}
+
+test("fetchZaiUsage sends the bearer key and parses the quota payload", async () => {
+	const { fetchFn, calls } = fakeZaiFetch();
+	const usage = await fetchZaiUsage(ZAI_GLM_PROVIDER, "zai-key", fetchFn, NOW);
+	assert.equal(usage?.provider, "zai-glm");
+	assert.equal(usage?.plan, "max");
+	assert.equal(calls[0].url, "https://api.z.ai/api/monitor/usage/quota/limit");
+	assert.equal(calls[0].headers.Authorization, "Bearer zai-key");
+
+	const silent = fakeZaiFetch();
+	assert.equal(await fetchZaiUsage(ZAI_PROVIDER, undefined, silent.fetchFn, NOW), undefined);
+	assert.equal(silent.calls.length, 0, "without a key nothing must be sent anywhere");
+	assert.equal(await fetchZaiUsage(ZAI_PROVIDER, "zai-key", fakeZaiFetch({}, false).fetchFn, NOW), undefined);
 });
 
 test("parseUsageHeaders picks whichever provider the headers belong to", () => {

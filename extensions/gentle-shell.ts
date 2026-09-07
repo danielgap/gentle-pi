@@ -11,7 +11,7 @@ import { SessionWorktreeRegistry, SESSION_WORKTREE_CHANGED, resolveSessionWorktr
 import { CARD_TONE, renderCard, type Card, type CardTheme } from "../lib/shell-card.ts";
 import { GentleAiDevBinaryOverrideError, resolveGentleAiDevBinaryOverride } from "../lib/gentle-ai-binary.ts";
 import { framePromptLines, PROMPT_HINT, PROMPT_STATE, withPromptHint, type PromptState } from "../lib/shell-prompt.ts";
-import { accountIdFromToken, CODEX_PROVIDER, CODEX_USAGE_URL, parseCodexUsage, parseUsageHeaders, UsageStore, type ProviderUsage } from "../lib/shell-usage.ts";
+import { accountIdFromToken, CODEX_PROVIDER, CODEX_USAGE_URL, parseCodexUsage, parseUsageHeaders, parseZaiUsage, UsageStore, ZAI_USAGE_PROVIDERS, ZAI_USAGE_URL, type ProviderUsage } from "../lib/shell-usage.ts";
 import { UsageView } from "../lib/shell-usage-view.ts";
 import { sidebarPart } from "../lib/shell-sidebar.ts";
 import { installSidebar, invalidateSidebar } from "../lib/shell-sidebar-layout.ts";
@@ -450,6 +450,19 @@ export async function fetchCodexUsage(token: string | undefined, fetchFn: typeof
 	}
 }
 
+// z.ai's quota endpoint is undocumented; the API key pi already holds is the
+// only thing it needs, and unknown shapes degrade to "no usage yet".
+export async function fetchZaiUsage(provider: string, key: string | undefined, fetchFn: typeof fetch, now: number): Promise<ProviderUsage | undefined> {
+	if (!key) return undefined;
+	try {
+		const response = await fetchFn(ZAI_USAGE_URL, { headers: { Authorization: `Bearer ${key}` } });
+		if (!response.ok) return undefined;
+		return parseZaiUsage(provider, await response.json(), now);
+	} catch {
+		return undefined;
+	}
+}
+
 export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = process.env, overrides: Partial<ShellDeps> = {}): void {
 	if (!shellEnabled(env)) return;
 	const deps: ShellDeps = { ...defaultShellDeps, ...overrides };
@@ -458,12 +471,12 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 	let usageFetchedAt = 0;
 	const refreshUsage = async (ctx: ExtensionContext, force: boolean) => {
 		const provider = ctx.model?.provider;
-		if (provider !== CODEX_PROVIDER) return;
+		if (!provider || (provider !== CODEX_PROVIDER && !ZAI_USAGE_PROVIDERS.includes(provider))) return;
 		const now = deps.now();
 		if (!force && now - usageFetchedAt < USAGE_REFRESH_MS) return;
 		usageFetchedAt = now;
-		const token = await ctx.modelRegistry.getApiKeyForProvider(CODEX_PROVIDER).catch(() => undefined);
-		const fetched = await fetchCodexUsage(token, deps.fetch, deps.now());
+		const key = await ctx.modelRegistry.getApiKeyForProvider(provider).catch(() => undefined);
+		const fetched = provider === CODEX_PROVIDER ? await fetchCodexUsage(key, deps.fetch, deps.now()) : await fetchZaiUsage(provider, key, deps.fetch, deps.now());
 		if (!fetched) return;
 		usage.record(fetched);
 		renderHost?.invalidateSidebar?.();
