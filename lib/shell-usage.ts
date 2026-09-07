@@ -80,6 +80,12 @@ export const ZAI_GLM_PROVIDER = "zai-glm";
 export const ZAI_USAGE_PROVIDERS: readonly string[] = [ZAI_PROVIDER, ZAI_GLM_PROVIDER];
 export const ZAI_USAGE_URL = "https://api.z.ai/api/monitor/usage/quota/limit";
 const ZAI_MAIN_LIMIT = "zai";
+
+// The fetch-refresh path applies to codex and the z.ai providers; anthropic
+// usage arrives from response headers instead (see parseUsageHeaders).
+export function isUsageProvider(provider: string): boolean {
+	return provider === CODEX_PROVIDER || ZAI_USAGE_PROVIDERS.includes(provider);
+}
 // z.ai meters its GLM Coding Plan in token windows keyed by unit: 3 is the
 // 5-hour rolling window, 6 the weekly one. The web-search counter rides the
 // same array as TIME_LIMIT and stays out of the subscription view.
@@ -167,19 +173,25 @@ export function parseCodexUsage(payload: unknown, now: number): ProviderUsage {
 // z.ai's quota endpoint is undocumented: the token windows arrive as integer
 // percentages with epoch-millisecond resets (older plans labelled them
 // CREDIT_LIMIT), so unknown shapes degrade to empty limits instead of failing.
+// One limits entry becomes one window when it names a known token-window
+// unit, a token/credit limit type, and a finite percentage; everything else
+// is skipped. Percentages outside 0-100 are clamped so a stray server value
+// can never render a broken bar.
+function zaiWindow(entry: RawZaiLimit): UsageWindow | undefined {
+	const windowSeconds = typeof entry.unit === "number" ? ZAI_TOKEN_UNITS.get(entry.unit) : undefined;
+	if (windowSeconds === undefined) return undefined;
+	if (entry.type !== "TOKENS_LIMIT" && entry.type !== "CREDIT_LIMIT") return undefined;
+	if (typeof entry.percentage !== "number" || !Number.isFinite(entry.percentage)) return undefined;
+	const usedPercent = Math.min(100, Math.max(0, entry.percentage));
+	return { label: windowLabel(windowSeconds), usedPercent, windowSeconds, resetAt: typeof entry.nextResetTime === "number" ? entry.nextResetTime : null };
+}
+
 export function parseZaiUsage(provider: string, payload: unknown, now: number): ProviderUsage {
 	const raw = (payload ?? {}) as RawZaiUsage;
-	const windows: UsageWindow[] = [];
 	const entries = Array.isArray(raw.data?.limits) ? raw.data.limits : [];
-	for (const entry of entries) {
-		const item = (entry ?? {}) as RawZaiLimit;
-		const windowSeconds = typeof item.unit === "number" ? ZAI_TOKEN_UNITS.get(item.unit) : undefined;
-		if (windowSeconds === undefined) continue;
-		if (item.type !== "TOKENS_LIMIT" && item.type !== "CREDIT_LIMIT") continue;
-		if (typeof item.percentage !== "number") continue;
-		windows.push({ label: windowLabel(windowSeconds), usedPercent: item.percentage, windowSeconds, resetAt: typeof item.nextResetTime === "number" ? item.nextResetTime : null });
-	}
-	const limits = windows.length > 0 ? [{ name: ZAI_MAIN_LIMIT, windows, limitReached: false }] : [];
+	const windows = entries.map((entry) => zaiWindow((entry ?? {}) as RawZaiLimit)).filter((window): window is UsageWindow => window !== undefined);
+	const limitReached = windows.some((window) => window.usedPercent >= 100);
+	const limits = windows.length > 0 ? [{ name: ZAI_MAIN_LIMIT, windows, limitReached }] : [];
 	return { provider, plan: typeof raw.data?.level === "string" ? raw.data.level : undefined, limits, fetchedAt: now };
 }
 
