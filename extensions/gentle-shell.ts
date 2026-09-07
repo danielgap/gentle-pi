@@ -10,7 +10,7 @@ import { ChangesView } from "../lib/shell-changes-view.ts";
 import { CARD_TONE, renderCard, type Card, type CardTheme } from "../lib/shell-card.ts";
 import { GentleAiDevBinaryOverrideError, resolveGentleAiDevBinaryOverride } from "../lib/gentle-ai-binary.ts";
 import { framePromptLines, panelPainter, PROMPT_HINT, PROMPT_STATE, withPromptHint, type PromptState } from "../lib/shell-prompt.ts";
-import { accountIdFromToken, CODEX_PROVIDER, CODEX_USAGE_URL, parseCodexUsage, parseUsageHeaders, parseZaiUsage, UsageStore, ZAI_USAGE_PROVIDERS, ZAI_USAGE_URL, type ProviderUsage } from "../lib/shell-usage.ts";
+import { accountIdFromToken, CODEX_PROVIDER, CODEX_USAGE_URL, isUsageProvider, parseCodexUsage, parseUsageHeaders, parseZaiUsage, UsageStore, ZAI_USAGE_URL, type ProviderUsage } from "../lib/shell-usage.ts";
 import { UsageView } from "../lib/shell-usage-view.ts";
 
 // Gentle Shell: the visual layer gentle-pi puts on top of pi. It installs the
@@ -414,11 +414,14 @@ export async function fetchCodexUsage(token: string | undefined, fetchFn: typeof
 }
 
 // z.ai's quota endpoint is undocumented; the API key pi already holds is the
-// only thing it needs, and unknown shapes degrade to "no usage yet".
+// only thing it needs, and unknown shapes degrade to "no usage yet". A
+// bounded timeout keeps a hung request from pinning the refresh cycle.
+const ZAI_FETCH_TIMEOUT_MS = 10_000;
+
 export async function fetchZaiUsage(provider: string, key: string | undefined, fetchFn: typeof fetch, now: number): Promise<ProviderUsage | undefined> {
 	if (!key) return undefined;
 	try {
-		const response = await fetchFn(ZAI_USAGE_URL, { headers: { Authorization: `Bearer ${key}` } });
+		const response = await fetchFn(ZAI_USAGE_URL, { headers: { Authorization: `Bearer ${key}` }, signal: AbortSignal.timeout(ZAI_FETCH_TIMEOUT_MS) });
 		if (!response.ok) return undefined;
 		return parseZaiUsage(provider, await response.json(), now);
 	} catch {
@@ -432,15 +435,21 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 	const usage = new UsageStore();
 	let renderHost: ShellRenderHost | undefined;
 	let usageFetchedAt = 0;
-	const refreshUsage = async (ctx: ExtensionContext, force: boolean) => {
+	const refreshUsage = async (ctx: ExtensionContext, force: boolean, announceFailure = false) => {
 		const provider = ctx.model?.provider;
-		if (!provider || (provider !== CODEX_PROVIDER && !ZAI_USAGE_PROVIDERS.includes(provider))) return;
+		if (!provider || !isUsageProvider(provider)) return;
 		const now = deps.now();
 		if (!force && now - usageFetchedAt < USAGE_REFRESH_MS) return;
 		usageFetchedAt = now;
 		const key = await ctx.modelRegistry.getApiKeyForProvider(provider).catch(() => undefined);
-		const fetched = provider === CODEX_PROVIDER ? await fetchCodexUsage(key, deps.fetch, deps.now()) : await fetchZaiUsage(provider, key, deps.fetch, deps.now());
-		if (!fetched) return;
+    		const fetched = provider === CODEX_PROVIDER ? await fetchCodexUsage(key, deps.fetch, deps.now()) : await fetchZaiUsage(provider, key, deps.fetch, deps.now());
+    		if (!fetched) {
+    			// Background refreshes stay quiet, but a user-triggered refresh
+    			// deserves an answer: "no usage yet" and "the quota request
+    			// failed" are different situations.
+    			if (announceFailure) ctx.ui.notify(`${provider} usage unavailable: the quota request failed`, "warning");
+    			return;
+    		}
 		usage.record(fetched);
 		renderHost?.requestRender();
 	};
@@ -458,14 +467,14 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 	pi.registerCommand(USAGE_COMMAND_NAME, {
 		description: "Show subscription usage windows for the connected providers. Press r to refetch.",
 		handler: async (_args, ctx) => {
-			await refreshUsage(ctx, true);
+			await refreshUsage(ctx, true, true);
 			await ctx.ui.custom<null>(
 				(tui, theme, _keybindings, done) =>
 					new UsageView(usage, {
 						theme,
 						now: () => deps.now(),
 						active: () => (ctx.model ? { provider: ctx.model.provider } : undefined),
-						onRefresh: () => refreshUsage(ctx, true),
+						onRefresh: () => refreshUsage(ctx, true, true),
 						onClose: () => done(null),
 						requestRender: () => tui.requestRender(),
 					}),
