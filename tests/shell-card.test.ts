@@ -84,3 +84,23 @@ test("renderCard keeps the top rule at width with a two-cell glyph", () => {
 	const lines = renderCard(card({ glyph: "\u{1F339}\uFE0E" }), plainTheme, 60, { expanded: false, hint: "ctrl+o expand" });
 	for (const line of lines) assert.equal(visibleWidth(line), 60, `"${stripAnsi(line)}" is not 60 wide`);
 });
+
+test("renderCard truncates the preparing review capture group label to the terminal width", () => {
+	const ansiTheme = {
+		fg(_color: string, text: string) {
+			return `\u001B[36m${text}\u001B[0m`;
+		},
+	};
+	const lines = renderCard(
+		card({
+			glyph: "\u{1F339}\uFE0E",
+			title: "Gentle AI · preparing",
+			subtitle: "review capture group · risk · resilience · readability · reliability",
+		}),
+		ansiTheme,
+		87,
+		{ expanded: false },
+	);
+	assert.equal(visibleWidth(lines[0]), 87);
+	assert.ok(stripAnsi(lines[0]).includes("…"));
+});

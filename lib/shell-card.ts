@@ -73,9 +73,11 @@ function soft(theme: CardTheme, _tone: CardTone, text: string): string {
 export function cardTop(card: Card, theme: CardTheme, width: number, hint?: string): string {
 	const title = titleText(card, theme);
 	const hintWidth = hint ? visibleWidth(hint) + 2 : 0;
-	const fill = rule(width - title.width - 5 - hintWidth);
+	const titleWidth = Math.max(0, width - 5 - hintWidth);
+	const styledTitle = title.width > titleWidth ? truncateToWidth(title.styled, titleWidth, "…") : title.styled;
+	const fill = rule(width - Math.min(title.width, titleWidth) - 5 - hintWidth);
 	const tail = hint ? ` ${theme.fg(HINT_ROLE, hint)} ` : "";
-	return theme.fg(TONE_ROLE[card.tone], "╭") + soft(theme, card.tone, "─ ") + title.styled + soft(theme, card.tone, ` ${fill}`) + tail + soft(theme, card.tone, "╮");
+	return theme.fg(TONE_ROLE[card.tone], "╭") + soft(theme, card.tone, "─ ") + styledTitle + soft(theme, card.tone, ` ${fill}`) + tail + soft(theme, card.tone, "╮");
 }
 
 export function cardLine(text: string, tone: CardTone, theme: CardTheme, width: number): string {
