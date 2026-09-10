@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { AGENT_MODE, type AgentDefinition } from "../lib/agents-config.ts";
+import { AGENT_MODE, parseAgentsConfig, resolveAgentProfile, type AgentDefinition } from "../lib/agents-config.ts";
 import { TASK_STATUS, TaskStore } from "../lib/agents-protocol.ts";
 import { AgentRunner, childArguments, JsonLines, piCommand, type RunnerDeps, type RunnerHooks, type TaskRequest } from "../lib/agents-runner.ts";
 import { fakeChild, type FakeChild } from "./agents-fake-child.ts";
@@ -781,4 +781,39 @@ for (const lateEvents of [false, true]) test(`AgentRunner releases quarantined c
 	assert.deepEqual(finishes, [first.id], "cleanup must not finish the quarantined task twice");
 	assert.equal(observations.length, 1, "late cleanup does not redeliver observations");
 	assert.deepEqual(store.get(first.id), finished);
+});
+
+test("childArguments never launches the inherit routing sentinel as a model id", () => {
+	const config = parseAgentsConfig({ default_model: "openai-codex/gpt-5.6-sol", model_profiles: { explore: { model: "inherit" } } }, undefined);
+	const resolved = resolveAgentProfile(explorer, config);
+	assert.notEqual(resolved.model?.id, "inherit");
+	const args = childArguments(request({ model: resolved.model, thinking: resolved.thinking }));
+	assert.ok(!args.includes("inherit"));
+	const modelIndex = args.indexOf("--model");
+	if (modelIndex !== -1) assert.equal(args[modelIndex + 1], "openai-codex/gpt-5.6-sol");
+});
+
+test("AgentRunner does not disconnect an IPC channel the child already disconnected", async () => {
+	const h = harness();
+	h.runner.run(request());
+	await tick();
+	const child = h.children[0]!;
+	child.disconnectFromChild();
+	await tick();
+	assert.equal(child.disconnects, 0, "the host must not call disconnect after the child disconnect event");
+	h.runner.cancelAll();
+});
+
+test("a settled terminal error wins over any startup stderr diagnostic", async () => {
+	const h = harness({ exitOnKill: false });
+	const task = h.runner.run(request());
+	await tick();
+	const child = h.children[0]!;
+	child.stderr("PRE-RPC NOISE");
+	assert.equal(h.runner.cancel(task.id), true);
+	child.exit(17);
+	await tick();
+	const error = h.store.get(task.id)?.error ?? "";
+	assert.ok(!error.includes("startup diagnostic"));
+	assert.ok(error.length > 0);
 });

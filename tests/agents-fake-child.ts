@@ -15,6 +15,8 @@ export interface FakeChild {
 	sent: Array<Record<string, unknown>>;
 	disconnects: number;
 	message(event: Record<string, unknown>): void;
+	disconnectFromChild(): void;
+	stderr(text: string): void;
 }
 
 export function fakeChild(options: { exitOnKill?: boolean; pid?: number } = {}): FakeChild {
@@ -62,5 +64,5 @@ export function fakeChild(options: { exitOnKill?: boolean; pid?: number } = {}):
 			return child;
 		},
 	};
-	return { child, written, killed, sent, get disconnects() { return disconnects; }, message: (event) => emitter.emit("message", event), emit: (event) => stdout.write(`${JSON.stringify(event)}\n`), exit: (code) => emitter.emit("exit", code, null), fail: (message) => emitter.emit("error", new Error(message)) };
+	return { child, written, killed, sent, get disconnects() { return disconnects; }, message: (event) => emitter.emit("message", event), emit: (event) => stdout.write(`${JSON.stringify(event)}\n`), exit: (code) => emitter.emit("exit", code, null), fail: (message) => emitter.emit("error", new Error(message)), disconnectFromChild: () => emitter.emit("disconnect"), stderr: (text) => (child.stderr as PassThrough).write(text) };
 }

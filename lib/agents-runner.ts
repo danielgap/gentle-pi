@@ -164,6 +164,13 @@ interface PendingReply {
 	resolve(value: boolean): void;
 }
 
+const STDERR_TAIL_MAX_CHARS = 4_096;
+
+function appendStderrTail(tail: string, chunk: unknown): string {
+	const combined = tail + String(chunk);
+	return combined.length > STDERR_TAIL_MAX_CHARS ? combined.slice(-STDERR_TAIL_MAX_CHARS) : combined;
+}
+
 interface LiveTask {
 	child: ChildLike;
 	observations?: ChildObservationBuffer;
@@ -182,6 +189,8 @@ interface LiveTask {
 	nextId: number;
 	permissionBroker?: ParentStandingReviewPermissionBroker;
 	ipcClosed: boolean;
+	rpcStarted: boolean;
+	stderrTail: string;
 	acknowledgedIpcIds: Set<string>;
 	acknowledgedIpcOrder: string[];
 	mutationStarts: Map<string, { toolName: "write" | "edit"; toolCallId: string; path: string }>;
@@ -440,7 +449,7 @@ export class AgentRunner {
 			return;
 		}
 		const processGroup = detached && typeof child.pid === "number" && child.pid > 0 ? child.pid : undefined;
-		const live: LiveTask = { child, mutationStarts: new Map(), pending: new Map(), queries: new Map(), replies: new Map(), cancelStall: () => {}, cancelGrace: () => {}, processGroup, terminal: undefined, childExit: undefined, cleanupDeadlineAt: undefined, quarantined: false, nextId: 0, ipcClosed: false, acknowledgedIpcIds: new Set(), acknowledgedIpcOrder: [] };
+		const live: LiveTask = { child, mutationStarts: new Map(), pending: new Map(), queries: new Map(), replies: new Map(), cancelStall: () => {}, cancelGrace: () => {}, processGroup, terminal: undefined, childExit: undefined, cleanupDeadlineAt: undefined, quarantined: false, nextId: 0, ipcClosed: false, rpcStarted: false, stderrTail: "", acknowledgedIpcIds: new Set(), acknowledgedIpcOrder: [] };
 		if (request.prepareResponseObservations) {
 			let ready = false;
 			live.observationPreparation = () => ready;
@@ -464,7 +473,7 @@ export class AgentRunner {
 		child.channel?.unref?.();
 		child.on("error", (error) => this.childError(id, error));
 		child.on("message", (value) => this.receiveChildMessage(id, value));
-		child.on("disconnect", () => this.closeIpc(live));
+		child.on("disconnect", () => this.closeIpc(live, true));
 		let announced = false;
 		child.on("spawn", () => {
 			if (announced || this.live.get(id) !== live || live.terminal) return;
@@ -477,7 +486,7 @@ export class AgentRunner {
 		const lines = new JsonLines((value) => this.receive(id, request, value));
 		child.stdout.setEncoding("utf8");
 		child.stdout.on("data", (chunk: string) => lines.push(chunk));
-		child.stderr?.on("data", () => {});
+		child.stderr?.on("data", (chunk) => { live.stderrTail = appendStderrTail(live.stderrTail, chunk); });
 		child.on("exit", (code) => this.exited(id, code));
 		void this.send(id, { type: "get_state" }).then((response) => {
 			const data = response.data as { sessionFile?: unknown; model?: { provider?: unknown; id?: unknown } | null; thinkingLevel?: unknown } | undefined;
@@ -598,7 +607,7 @@ export class AgentRunner {
 		pending.resolve(accepted);
 	}
 
-	private closeIpc(live: LiveTask): void {
+	private closeIpc(live: LiveTask, childDisconnected = false): void {
 		if (live.ipcClosed) return;
 		live.ipcClosed = true;
 		for (const query of live.queries.values()) query.cancel();
@@ -606,6 +615,7 @@ export class AgentRunner {
 		for (const pending of live.replies.values()) pending.resolve(false);
 		live.replies.clear();
 		live.child.channel?.unref?.();
+		if (childDisconnected) return;
 		try { live.child.disconnect?.(); }
 		catch { /* Channel may already be disconnected. */ }
 	}
@@ -635,6 +645,7 @@ export class AgentRunner {
 		const live = this.live.get(id);
 		if (!live || live.terminal || !value || typeof value !== "object") return;
 		const raw = value as Record<string, unknown>;
+		live.rpcStarted = true;
 		this.armStall(id, live);
 		if (raw.type === "response") {
 			if (!live.observationPreparation) this.checkObservationGrant(live);
@@ -782,7 +793,7 @@ export class AgentRunner {
 		if (!live) return;
 		live.childExit = code;
 		if (this.groupExists(live)) {
-			if (!live.terminal) this.requestStop(id, TASK_STATUS.FAILED, `pi exited with code ${code ?? "unknown"} before agent_settled`);
+			if (!live.terminal) this.requestStop(id, TASK_STATUS.FAILED, this.startupExitError(live, code));
 			return;
 		}
 		this.completeExit(id, live);
@@ -800,7 +811,14 @@ export class AgentRunner {
 			return;
 		}
 		const terminal = live.terminal;
-		this.finish(id, terminal ? terminal.status : TASK_STATUS.FAILED, terminal ? terminal.error : `pi exited with code ${live.childExit ?? "unknown"} before agent_settled`, live);
+		this.finish(id, terminal ? terminal.status : TASK_STATUS.FAILED, terminal ? terminal.error : this.startupExitError(live, live.childExit ?? null), live);
+	}
+
+	private startupExitError(live: LiveTask, code: number | null): string {
+		const base = `pi exited with code ${code ?? "unknown"} before agent_settled`;
+		if (typeof code !== "number" || code === 0 || live.rpcStarted) return base;
+		const diagnostic = live.stderrTail.trim();
+		return diagnostic ? `${base} before RPC startup; startup diagnostic: ${diagnostic}` : base;
 	}
 
 	private finish(id: string, status: TaskRecord["status"], error: string | null, live?: LiveTask): void {

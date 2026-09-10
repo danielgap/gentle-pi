@@ -109,3 +109,40 @@ test("POSIX cleanup retains queue slots when a leader exits but its TERM-resisti
 		runner.cancel(fourth.id);
 	}
 });
+
+test("startup failures include only a bounded stderr tail", { skip: process.platform === "win32" }, async () => {
+	const store = new TaskStore();
+	const deps: RunnerDeps = {
+		spawn: (_command, _args, options) =>
+			nodeSpawn(process.execPath, ["-e", "process.stderr.write('UNIQUE-PREFIX-' + 'z'.repeat(6000) + 'TAIL-MARKER'); process.exit(17);"], { cwd: options.cwd, env: options.env, detached: options.detached, stdio: ["pipe", "pipe", "pipe"] }),
+		now: Date.now,
+		schedule: (fn, ms) => { const timer = setTimeout(fn, ms); return () => clearTimeout(timer); },
+		pi: { command: process.execPath, args: [] },
+	};
+	const runner = new AgentRunner(store, { maxConcurrency: 1, stallTimeoutMs: 5_000 }, deps, { askUser: async () => ({ cancelled: true }) });
+	const task = runner.run(request("stderr-bomb"));
+	await waitFor(() => store.get(task.id)?.status === TASK_STATUS.FAILED);
+	const error = store.get(task.id)?.error ?? "";
+	assert.ok(error.includes("startup diagnostic"), error);
+	assert.ok(error.includes("TAIL-MARKER"));
+	assert.ok(!error.includes("UNIQUE-PREFIX"), "the discarded stderr prefix must not survive");
+	assert.ok(error.length < 4_096 + 256, "the retained diagnostic must stay bounded");
+});
+
+test("children that complete RPC startup never report a startup stderr diagnostic", { skip: process.platform === "win32" }, async () => {
+	const store = new TaskStore();
+	const childScript = "process.stderr.write('RPC-ERA NOISE'); process.stdin.setEncoding('utf8'); process.stdin.on('data', (chunk) => { for (const line of chunk.split('\\n')) { if (!line) continue; try { const command = JSON.parse(line); process.stdout.write(JSON.stringify({ type: 'response', id: command.id, success: true }) + '\\n'); } catch {} } }); setTimeout(() => process.exit(17), 50);";
+	const deps: RunnerDeps = {
+		spawn: (_command, _args, options) =>
+			nodeSpawn(process.execPath, ["-e", childScript], { cwd: options.cwd, env: options.env, detached: options.detached, stdio: ["pipe", "pipe", "pipe"] }),
+		now: Date.now,
+		schedule: (fn, ms) => { const timer = setTimeout(fn, ms); return () => clearTimeout(timer); },
+		pi: { command: process.execPath, args: [] },
+	};
+	const runner = new AgentRunner(store, { maxConcurrency: 1, stallTimeoutMs: 5_000 }, deps, { askUser: async () => ({ cancelled: true }) });
+	const task = runner.run(request("rpc-then-exit"));
+	await waitFor(() => store.get(task.id)?.status === TASK_STATUS.FAILED);
+	const error = store.get(task.id)?.error ?? "";
+	assert.ok(!error.includes("startup diagnostic"), error);
+	assert.ok(error.includes("pi exited with code 17"));
+});
