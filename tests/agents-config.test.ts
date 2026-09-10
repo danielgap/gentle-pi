@@ -49,6 +49,23 @@ test("parseModelRef splits provider/id and accepts a bare id", () => {
 	assert.equal(parseModelRef("   "), undefined);
 });
 
+test("parseModelRef reserves the inherit routing sentinel for fallback", () => {
+	assert.equal(parseModelRef("inherit"), undefined);
+});
+
+test("inherit models defer to the next configured fallback", () => {
+	const config = parseAgentsConfig(
+		{ default_model: "openai-codex/gpt-5.6-sol", default_effort: "medium", model_profiles: { scout: { model: "inherit" } } },
+		undefined,
+	);
+	const byProfile = parseAgentDefinition("---\nname: scout\n---\nbody", "/x/scout.md", "global");
+	assert.ok(!("error" in byProfile));
+	assert.deepEqual(resolveAgentProfile(byProfile, config), { model: { provider: "openai-codex", id: "gpt-5.6-sol" }, thinking: "medium", source: { model: "default", thinking: "default" } });
+	const byDefinition = parseAgentDefinition("---\nname: scout\nmodel: inherit\n---\nbody", "/x/scout.md", "global");
+	assert.ok(!("error" in byDefinition));
+	assert.deepEqual(resolveAgentProfile(byDefinition, config), { model: { provider: "openai-codex", id: "gpt-5.6-sol" }, thinking: "medium", source: { model: "default", thinking: "default" } });
+});
+
 test("parseAgentDefinition builds a definition from the gentle-ai agent format", () => {
 	const agent = parseAgentDefinition(EXPLORER, "/home/x/.pi/agent/agents/gentle-ai-explore.md", "global");
 	assert.ok(!("error" in agent));

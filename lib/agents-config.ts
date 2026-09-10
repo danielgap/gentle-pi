@@ -153,7 +153,7 @@ export function parseFrontmatter(text: string): Frontmatter {
 export function parseModelRef(value: unknown): ModelRef | undefined {
 	if (typeof value !== "string") return undefined;
 	const trimmed = value.trim();
-	if (trimmed.length === 0) return undefined;
+	if (trimmed.length === 0 || trimmed === "inherit") return undefined;
 	const slash = trimmed.indexOf("/");
 	if (slash <= 0) return { provider: undefined, id: trimmed };
 	return { provider: trimmed.slice(0, slash), id: trimmed.slice(slash + 1) };
